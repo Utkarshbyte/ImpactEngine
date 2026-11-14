@@ -1,0 +1,195 @@
+{
+  "id": "ecommerce-core",
+  "name": "E-Commerce Core Infrastructure",
+  "nodes": [
+    {
+      "id": "postgres",
+      "name": "Primary Postgres DB",
+      "type": "database",
+      "criticality": 5,
+      "health": "HEALTHY",
+      "base_latency_ms": 35,
+      "sla_ms": 300,
+      "business_functions": ["Persistent Storage", "Transaction Ledger"],
+      "position": { "x": 80, "y": 260 }
+    },
+    {
+      "id": "redis",
+      "name": "Redis Session Cache",
+      "type": "cache",
+      "criticality": 3,
+      "health": "HEALTHY",
+      "base_latency_ms": 5,
+      "sla_ms": 80,
+      "business_functions": ["Fast Session Lookup"],
+      "position": { "x": 80, "y": 80 }
+    },
+    {
+      "id": "auth",
+      "name": "Auth Service",
+      "type": "service",
+      "criticality": 5,
+      "health": "HEALTHY",
+      "base_latency_ms": 25,
+      "sla_ms": 250,
+      "business_functions": ["User Authentication", "Session Security"],
+      "position": { "x": 340, "y": 80 }
+    },
+    {
+      "id": "payment",
+      "name": "Payment API",
+      "type": "service",
+      "criticality": 5,
+      "health": "HEALTHY",
+      "base_latency_ms": 110,
+      "sla_ms": 1200,
+      "business_functions": ["Payment Processing", "Revenue Collection"],
+      "position": { "x": 340, "y": 220 }
+    },
+    {
+      "id": "inventory",
+      "name": "Inventory Service",
+      "type": "service",
+      "criticality": 4,
+      "health": "HEALTHY",
+      "base_latency_ms": 40,
+      "sla_ms": 350,
+      "business_functions": ["Stock Reservation"],
+      "position": { "x": 340, "y": 380 }
+    },
+    {
+      "id": "checkout",
+      "name": "Checkout Service",
+      "type": "service",
+      "criticality": 5,
+      "health": "HEALTHY",
+      "base_latency_ms": 50,
+      "sla_ms": 600,
+      "business_functions": ["Customer Purchase"],
+      "position": { "x": 620, "y": 220 }
+    },
+    {
+      "id": "orders",
+      "name": "Order Service",
+      "type": "service",
+      "criticality": 4,
+      "health": "HEALTHY",
+      "base_latency_ms": 45,
+      "sla_ms": 500,
+      "business_functions": ["Order Processing", "Fulfillment Dispatch"],
+      "position": { "x": 880, "y": 280 }
+    },
+    {
+      "id": "revenue",
+      "name": "Revenue Pipeline",
+      "type": "pipeline",
+      "criticality": 4,
+      "health": "HEALTHY",
+      "base_latency_ms": 90,
+      "sla_ms": 3000,
+      "business_functions": ["Revenue Generation", "Financial Reconciliation"],
+      "position": { "x": 1140, "y": 200 }
+    },
+    {
+      "id": "analytics",
+      "name": "Analytics Engine",
+      "type": "service",
+      "criticality": 2,
+      "health": "HEALTHY",
+      "base_latency_ms": 140,
+      "sla_ms": 8000,
+      "business_functions": ["Business Intelligence"],
+      "position": { "x": 1140, "y": 380 }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-redis-auth",
+      "source": "redis",
+      "target": "auth",
+      "dependency": "non-critical",
+      "propagation": "SOFT",
+      "weight": 0.4
+    },
+    {
+      "id": "e-postgres-payment",
+      "source": "postgres",
+      "target": "payment",
+      "dependency": "critical",
+      "propagation": "HARD",
+      "weight": 1.0
+    },
+    {
+      "id": "e-postgres-inventory",
+      "source": "postgres",
+      "target": "inventory",
+      "dependency": "critical",
+      "propagation": "HARD",
+      "weight": 1.0
+    },
+    {
+      "id": "e-postgres-orders",
+      "source": "postgres",
+      "target": "orders",
+      "dependency": "critical",
+      "propagation": "HARD",
+      "weight": 1.0
+    },
+    {
+      "id": "e-auth-checkout",
+      "source": "auth",
+      "target": "checkout",
+      "dependency": "critical",
+      "propagation": "HARD",
+      "weight": 1.0
+    },
+    {
+      "id": "e-payment-checkout",
+      "source": "payment",
+      "target": "checkout",
+      "dependency": "critical",
+      "propagation": "HARD",
+      "weight": 1.0
+    },
+    {
+      "id": "e-inventory-checkout",
+      "source": "inventory",
+      "target": "checkout",
+      "dependency": "important",
+      "propagation": "SOFT",
+      "weight": 0.6
+    },
+    {
+      "id": "e-checkout-orders",
+      "source": "checkout",
+      "target": "orders",
+      "dependency": "important",
+      "propagation": "SOFT",
+      "weight": 0.7
+    },
+    {
+      "id": "e-orders-revenue",
+      "source": "orders",
+      "target": "revenue",
+      "dependency": "important",
+      "propagation": "SOFT",
+      "weight": 0.7
+    },
+    {
+      "id": "e-orders-analytics",
+      "source": "orders",
+      "target": "analytics",
+      "dependency": "non-critical",
+      "propagation": "OPTIONAL",
+      "weight": 0.2
+    },
+    {
+      "id": "e-revenue-analytics",
+      "source": "revenue",
+      "target": "analytics",
+      "dependency": "non-critical",
+      "propagation": "SOFT",
+      "weight": 0.4
+    }
+  ]
+}
