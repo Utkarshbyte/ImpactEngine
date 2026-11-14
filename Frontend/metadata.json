@@ -1,0 +1,6 @@
+{
+  "name": "ImpactEngine",
+  "description": "Minimalistic infrastructure dependency topology explorer and failure cascade simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
