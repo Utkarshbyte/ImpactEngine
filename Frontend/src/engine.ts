@@ -1,3 +1,4 @@
+export type DependencyType = 'hard' | 'soft';
 export type FailureType = 'down' | 'degraded';
 export type NodeVisualState = 'normal' | 'root' | 'broken' | 'warning' | 'mitigated';
 
@@ -6,458 +7,691 @@ export interface GraphNode {
   label: string;
   tier?: string;
   protocol?: string;
+  criticality?: string;
   description?: string;
-  criticality?: number;
-  business_functions?: string[];
-  base_latency_ms?: number;
-  sla_ms?: number;
-  position?: { x: number; y: number };
 }
 
 export interface GraphEdge {
-  id?: string;
   source: string;
   target: string;
-  dependency_type?: 'hard' | 'soft';
-  propagation?: string;
-  weight?: number;
+  dependency_type?: DependencyType;
 }
 
 export interface GraphData {
-  id?: string;
-  name?: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
 }
 
 export interface CascadeEntry {
   id: string;
-  name?: string;
-  state: 'broken' | 'warning';
+  state: 'broken' | 'warning' | 'degraded';
   hop: number;
   reason: string;
-  simulated_latency_ms?: number | null;
-  business_functions?: string[];
 }
 
 export interface SimulationResult {
   root_cause: string;
   failure_type: FailureType;
+  criticality: string;
   blast_radius_count: number;
   broken_count: number;
   warning_count: number;
-  criticality: string;
-  criticality_score?: number;
-  business_impact?: string[];
+  mitigated_nodes?: string[];
+  baseline_blast_count?: number;
+  saved_count?: number;
   cascade: CascadeEntry[];
 }
 
-const API_BASE = 'http://127.0.0.1:8000';
-
-const PROTOCOL_BY_TYPE: Record<string, string> = {
-  database: 'TCP / SQL',
-  cache: 'RESP / TCP',
-  gateway: 'HTTPS / REST',
-  pipeline: 'Async Stream',
-  frontend: 'HTTPS',
-  service: 'gRPC / REST',
-};
-
-function normalizeBackendGraph(raw: any): GraphData {
-  const nodes: GraphNode[] = (raw.nodes || []).map((n: any) => {
-    const nodeType = String(n.type || 'service');
-    const bizList: string[] = Array.isArray(n.business_functions) ? n.business_functions : [];
-    return {
-      id: String(n.id),
-      label: String(n.name || n.label || n.id),
-      tier: nodeType.toUpperCase(),
-      protocol: n.protocol || PROTOCOL_BY_TYPE[nodeType.toLowerCase()] || 'REST',
-      description:
-        n.description ||
-        (bizList.length > 0
-          ? `Supports ${bizList.join(', ')} · SLA ${n.sla_ms ?? 500}ms (Crit ${n.criticality ?? 3}/5)`
-          : `Service tier: ${nodeType}`),
-      criticality: n.criticality ?? 3,
-      business_functions: bizList,
-      base_latency_ms: n.base_latency_ms ?? 30,
-      sla_ms: n.sla_ms ?? 500,
-      position: n.position,
-    };
-  });
-
-  const edges: GraphEdge[] = (raw.edges || []).map((e: any, idx: number) => {
-    const prop = String(e.propagation || e.dependency_type || 'HARD').toUpperCase();
-    return {
-      id: e.id || `e-${e.source}-${e.target}-${idx}`,
-      source: String(e.source),
-      target: String(e.target),
-      dependency_type: prop === 'HARD' ? 'hard' : 'soft',
-      propagation: prop,
-      weight: e.weight ?? 1.0,
-    };
-  });
-
-  return {
-    id: raw.id || 'ecommerce-core',
-    name: raw.name || 'Infrastructure Topology',
-    nodes,
-    edges,
-  };
+export interface SpofRisk {
+  id: string;
+  label: string;
+  blastCount: number;
+  brokenCount: number;
+  pct: number;
 }
 
-function normalizeSimulationResult(raw: any, requestedMode: FailureType): SimulationResult {
-  const cascade: CascadeEntry[] = (raw.affected_nodes || []).map((n: any) => ({
-    id: String(n.id),
-    name: String(n.name || n.id),
-    state: String(n.state).toUpperCase() === 'DOWN' ? 'broken' : 'warning',
-    hop: Number(n.hop ?? 1),
-    reason: String(n.reason || 'Propagated dependency impact'),
-    simulated_latency_ms: n.simulated_latency_ms ?? null,
-    business_functions: n.business_functions || [],
-  }));
-
-  const severity = String(raw.severity || 'MEDIUM').toUpperCase();
-  const score = raw.criticality_score != null ? ` · ${raw.criticality_score}/10` : '';
-
-  return {
-    root_cause: String(raw.scenario?.node || raw.root_cause || ''),
-    failure_type: requestedMode,
-    blast_radius_count: Number(raw.blast_radius?.affected ?? cascade.length),
-    broken_count: Number(
-      raw.blast_radius?.down_count ?? cascade.filter((c) => c.state === 'broken').length
-    ),
-    warning_count: Number(
-      raw.blast_radius?.degraded_count ?? cascade.filter((c) => c.state !== 'broken').length
-    ),
-    criticality: `${severity}${score}`,
-    criticality_score: raw.criticality_score,
-    business_impact: Array.isArray(raw.business_impact) ? raw.business_impact : [],
-    cascade,
-  };
+export interface PositionedNode extends GraphNode {
+  x: number;
+  y: number;
 }
 
-const FALLBACK_GRAPH: GraphData = normalizeBackendGraph({
-  id: 'ecommerce-core',
-  name: 'E-Commerce Core Infrastructure',
+export const DEFAULT_API_BASE = 'http://127.0.0.1:8000';
+
+export const ECOMMERCE_PRESET: GraphData = {
   nodes: [
-    { id: 'postgres', name: 'Primary Postgres DB', type: 'database', criticality: 5, base_latency_ms: 35, sla_ms: 300, business_functions: ['Persistent Storage', 'Transaction Ledger'], position: { x: 80, y: 260 } },
-    { id: 'redis', name: 'Redis Session Cache', type: 'cache', criticality: 3, base_latency_ms: 5, sla_ms: 80, business_functions: ['Fast Session Lookup'], position: { x: 80, y: 80 } },
-    { id: 'auth', name: 'Auth Service', type: 'service', criticality: 5, base_latency_ms: 25, sla_ms: 250, business_functions: ['User Authentication'], position: { x: 340, y: 80 } },
-    { id: 'payment', name: 'Payment API', type: 'service', criticality: 5, base_latency_ms: 110, sla_ms: 1200, business_functions: ['Payment Processing', 'Revenue Collection'], position: { x: 340, y: 220 } },
-    { id: 'inventory', name: 'Inventory Service', type: 'service', criticality: 4, base_latency_ms: 40, sla_ms: 350, business_functions: ['Stock Reservation'], position: { x: 340, y: 380 } },
-    { id: 'checkout', name: 'Checkout Service', type: 'service', criticality: 5, base_latency_ms: 50, sla_ms: 600, business_functions: ['Customer Purchase'], position: { x: 620, y: 220 } },
-    { id: 'orders', name: 'Order Service', type: 'service', criticality: 4, base_latency_ms: 45, sla_ms: 500, business_functions: ['Order Processing', 'Fulfillment Dispatch'], position: { x: 880, y: 280 } },
-    { id: 'revenue', name: 'Revenue Pipeline', type: 'pipeline', criticality: 4, base_latency_ms: 90, sla_ms: 3000, business_functions: ['Revenue Generation'], position: { x: 1140, y: 200 } },
-    { id: 'analytics', name: 'Analytics Engine', type: 'service', criticality: 2, base_latency_ms: 140, sla_ms: 8000, business_functions: ['Business Intelligence'], position: { x: 1140, y: 380 } },
+    { id: 'edge-cdn', label: 'Edge CDN', tier: 'Edge', protocol: 'HTTPS', criticality: 'High', description: 'Global edge routing and TLS termination.' },
+    { id: 'api-gateway', label: 'API Gateway', tier: 'Ingress', protocol: 'HTTP/2', criticality: 'Critical', description: 'Primary request router, rate limiter, and JWT verifier.' },
+    { id: 'auth-service', label: 'Auth Service', tier: 'Core', protocol: 'gRPC', criticality: 'Critical', description: 'Session issuance, OAuth validation, and RBAC claims.' },
+    { id: 'catalog-api', label: 'Catalog API', tier: 'Domain', protocol: 'REST', criticality: 'High', description: 'Product metadata, pricing tiers, and SKU availability.' },
+    { id: 'search-index', label: 'Search Index', tier: 'Data', protocol: 'HTTP', criticality: 'Medium', description: 'Full-text and faceted product search engine.' },
+    { id: 'cart-service', label: 'Cart Service', tier: 'Domain', protocol: 'gRPC', criticality: 'High', description: 'Ephemeral shopping cart state and promo evaluation.' },
+    { id: 'checkout-api', label: 'Checkout API', tier: 'Domain', protocol: 'gRPC', criticality: 'Critical', description: 'Orchestrates order validation, tax, and payment capture.' },
+    { id: 'payment-gw', label: 'Payment Gateway', tier: 'External', protocol: 'HTTPS', criticality: 'Critical', description: 'External card processor and tokenization bridge.' },
+    { id: 'inventory-db', label: 'Inventory DB', tier: 'Data', protocol: 'PostgreSQL', criticality: 'Critical', description: 'ACID stock ledger and reservation locks.' },
+    { id: 'order-queue', label: 'Order Queue', tier: 'Async', protocol: 'AMQP', criticality: 'High', description: 'Durable fulfillment event stream.' },
+    { id: 'notify-worker', label: 'Notify Worker', tier: 'Async', protocol: 'SMTP/Push', criticality: 'Low', description: 'Transactional receipts and shipment alerts.' },
+    { id: 'analytics-sink', label: 'Analytics Sink', tier: 'Telemetry', protocol: 'Kafka', criticality: 'Low', description: 'Clickstream and conversion event warehouse.' },
   ],
   edges: [
-    { source: 'redis', target: 'auth', propagation: 'SOFT' },
-    { source: 'postgres', target: 'payment', propagation: 'HARD' },
-    { source: 'postgres', target: 'inventory', propagation: 'HARD' },
-    { source: 'postgres', target: 'orders', propagation: 'HARD' },
-    { source: 'auth', target: 'checkout', propagation: 'HARD' },
-    { source: 'payment', target: 'checkout', propagation: 'HARD' },
-    { source: 'inventory', target: 'checkout', propagation: 'SOFT' },
-    { source: 'checkout', target: 'orders', propagation: 'SOFT' },
-    { source: 'orders', target: 'revenue', propagation: 'SOFT' },
-    { source: 'orders', target: 'analytics', propagation: 'OPTIONAL' },
-    { source: 'revenue', target: 'analytics', propagation: 'SOFT' },
+    { source: 'edge-cdn', target: 'api-gateway', dependency_type: 'hard' },
+    { source: 'api-gateway', target: 'auth-service', dependency_type: 'hard' },
+    { source: 'api-gateway', target: 'catalog-api', dependency_type: 'hard' },
+    { source: 'api-gateway', target: 'cart-service', dependency_type: 'hard' },
+    { source: 'api-gateway', target: 'checkout-api', dependency_type: 'hard' },
+    { source: 'catalog-api', target: 'search-index', dependency_type: 'soft' },
+    { source: 'catalog-api', target: 'inventory-db', dependency_type: 'hard' },
+    { source: 'cart-service', target: 'catalog-api', dependency_type: 'hard' },
+    { source: 'cart-service', target: 'auth-service', dependency_type: 'soft' },
+    { source: 'checkout-api', target: 'auth-service', dependency_type: 'hard' },
+    { source: 'checkout-api', target: 'cart-service', dependency_type: 'hard' },
+    { source: 'checkout-api', target: 'inventory-db', dependency_type: 'hard' },
+    { source: 'checkout-api', target: 'payment-gw', dependency_type: 'hard' },
+    { source: 'checkout-api', target: 'order-queue', dependency_type: 'hard' },
+    { source: 'notify-worker', target: 'order-queue', dependency_type: 'hard' },
+    { source: 'analytics-sink', target: 'order-queue', dependency_type: 'soft' },
+    { source: 'analytics-sink', target: 'api-gateway', dependency_type: 'soft' },
   ],
-});
+};
 
-export async function checkBackendHealth(): Promise<boolean> {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = 2200): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${API_BASE}/`, { signal: AbortSignal.timeout(2500) });
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function checkBackendHealth(apiBase = DEFAULT_API_BASE): Promise<boolean> {
+  try {
+    const res = await fetchWithTimeout(`${apiBase}/`, { method: 'GET' }, 1800);
     return res.ok;
   } catch {
     return false;
   }
 }
 
-export async function loadEcommerceArchitecture(): Promise<{
-  graph: GraphData;
-  via: 'backend' | 'fallback';
-}> {
+export async function loadEcommerceArchitecture(
+  apiBase = DEFAULT_API_BASE
+): Promise<{ graph: GraphData; via: 'backend' | 'local' }> {
   try {
-    const res = await fetch(`${API_BASE}/graph?graph_id=ecommerce-core`, {
-      signal: AbortSignal.timeout(4000),
-    });
-    if (!res.ok) throw new Error('Backend unavailable');
-    const data = await res.json();
-    return { graph: normalizeBackendGraph(data), via: 'backend' };
+    const res = await fetchWithTimeout(`${apiBase}/api/preset/ecommerce`, { method: 'GET' }, 1800);
+    if (res.ok) {
+      const json = await res.json();
+      if (json?.graph_data?.nodes?.length) {
+        return { graph: json.graph_data as GraphData, via: 'backend' };
+      }
+    }
   } catch {
-    return { graph: FALLBACK_GRAPH, via: 'fallback' };
+    // Fallback to embedded architecture model when FastAPI is offline.
+  }
+  return { graph: ECOMMERCE_PRESET, via: 'local' };
+}
+
+export function validateGithubUrl(raw: string): { owner: string; repo: string; normalized: string } | null {
+  try {
+    const parsed = new URL(raw.trim());
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com') return null;
+    const parts = parsed.pathname.replace(/^\/+|\/+$/g, '').split('/');
+    if (parts.length < 2 || !parts[0] || !parts[1]) return null;
+    const owner = parts[0];
+    const repo = parts[1].replace(/\.git$/, '');
+    return { owner, repo, normalized: `https://github.com/${owner}/${repo}` };
+  } catch {
+    return null;
   }
 }
 
 export async function ingestGithubRepository(
-  repoUrl: string
-): Promise<{ graph: GraphData; source: string }> {
-  const cleanUrl = repoUrl.trim().replace(/\/+$/, '');
-  const match = cleanUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)/i);
-  if (!match) {
-    throw new Error('Enter a valid GitHub URL (https://github.com/owner/repo)');
+  url: string,
+  apiBase = DEFAULT_API_BASE
+): Promise<{ graph: GraphData; source: string; via: 'backend' | 'github' }> {
+  const parsed = validateGithubUrl(url);
+  if (!parsed) {
+    throw new Error('Enter a valid GitHub URL such as https://github.com/organization/repository');
   }
 
-  const [, owner, repo] = match;
-  const apiRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/trees/HEAD?recursive=1`);
-  if (!apiRes.ok) {
-    throw new Error('Could not fetch public repository tree from GitHub.');
-  }
-
-  const treeData = await apiRes.json();
-  const paths: string[] = (treeData.tree || [])
-    .filter((item: any) => item.type === 'blob')
-    .map((item: any) => String(item.path));
-
-  const topDirs = Array.from(
-    new Set(
-      paths
-        .filter((p) => p.includes('/'))
-        .map((p) => p.split('/')[0])
-        .filter((dir) => !dir.startsWith('.') && !['docs', 'tests', 'test', 'scripts'].includes(dir.toLowerCase()))
-    )
-  ).slice(0, 8);
-
-  const serviceNames = topDirs.length >= 2 ? topDirs : ['api-gateway', 'core-service', 'worker', 'datastore'];
-  const rawNodes = serviceNames.map((name, idx) => ({
-    id: name.toLowerCase().replace(/[^a-z0-9-_]/g, '-'),
-    name,
-    type: idx === serviceNames.length - 1 ? 'database' : 'service',
-    criticality: idx === 0 ? 5 : 4,
-    base_latency_ms: 25 + idx * 10,
-    sla_ms: 400 + idx * 100,
-    business_functions: [`${name} Operations`],
-  }));
-
-  const rawEdges = rawNodes.slice(0, -1).map((node, idx) => ({
-    source: rawNodes[idx + 1].id,
-    target: node.id,
-    propagation: idx % 2 === 0 ? 'HARD' : 'SOFT',
-  }));
-
-  const normalized = normalizeBackendGraph({
-    id: `${owner}-${repo}`,
-    name: `${owner}/${repo}`,
-    nodes: rawNodes,
-    edges: rawEdges,
-  });
-
-  // Persist to SQLite backend if running so /simulate works against it
   try {
-    await fetch(`${API_BASE}/graph`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: normalized.id,
-        name: normalized.name,
-        nodes: normalized.nodes.map((n) => ({
-          id: n.id,
-          name: n.label,
-          type: (n.tier || 'service').toLowerCase(),
-          criticality: n.criticality || 4,
-          base_latency_ms: n.base_latency_ms || 30,
-          sla_ms: n.sla_ms || 500,
-          business_functions: n.business_functions || [],
-        })),
-        edges: normalized.edges.map((e) => ({
-          source: e.source,
-          target: e.target,
-          dependency: e.dependency_type === 'hard' ? 'critical' : 'important',
-          propagation: e.dependency_type === 'hard' ? 'HARD' : 'SOFT',
-        })),
-      }),
-    });
+    const res = await fetchWithTimeout(
+      `${apiBase}/api/ingest`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ github_url: parsed.normalized }),
+      },
+      6000
+    );
+    if (res.ok) {
+      const json = await res.json();
+      if (json?.graph_data?.nodes?.length) {
+        return { graph: json.graph_data as GraphData, source: parsed.normalized, via: 'backend' };
+      }
+    }
   } catch {
-    // Offline fallback still works
+    // Fall back to direct GitHub tree structural inference
   }
 
-  return { graph: normalized, source: cleanUrl };
+  const ghRes = await fetchWithTimeout(
+    `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/git/trees/HEAD?recursive=1`,
+    { method: 'GET', headers: { Accept: 'application/vnd.github+json' } },
+    8000
+  );
+
+  if (!ghRes.ok) {
+    if (ghRes.status === 404) {
+      throw new Error(`Repository ${parsed.owner}/${parsed.repo} was not found or is private.`);
+    }
+    throw new Error(`Could not inspect repository (${ghRes.status}).`);
+  }
+
+  const treeJson = await ghRes.json();
+  const entries: Array<{ path: string; type: string }> = Array.isArray(treeJson?.tree) ? treeJson.tree : [];
+
+  const ignored = new Set(['node_modules', '.git', '.github', 'dist', 'build', 'coverage', '__pycache__', '.venv', 'docs', 'tests', 'test']);
+  const moduleBuckets = new Map<string, number>();
+
+  for (const item of entries) {
+    if (!item.path) continue;
+    const segs = item.path.split('/');
+    const top = segs[0];
+    if (!top || ignored.has(top.toLowerCase()) || top.startsWith('.')) continue;
+
+    if (segs.length >= 2 && (top === 'src' || top === 'app' || top === 'services' || top === 'packages' || top === 'apps' || top === 'cmd' || top === 'internal')) {
+      const sub = `${top}/${segs[1].replace(/\.[a-z0-9]+$/i, '')}`;
+      moduleBuckets.set(sub, (moduleBuckets.get(sub) ?? 0) + 1);
+    } else if (item.type === 'tree' && segs.length === 1) {
+      moduleBuckets.set(top, (moduleBuckets.get(top) ?? 0) + 1);
+    } else if (segs.length === 1 && /\.(ts|tsx|py|go|rs|java|js)$/.test(top)) {
+      const clean = top.replace(/\.[a-z0-9]+$/i, '');
+      moduleBuckets.set(clean, (moduleBuckets.get(clean) ?? 0) + 1);
+    }
+  }
+
+  const ranked = Array.from(moduleBuckets.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 14)
+    .map(([name, fileCount]) => ({
+      id: name.toLowerCase().replace(/[^a-z0-9/_-]+/g, '-'),
+      label: name.split('/').pop() || name,
+      tier: name.includes('/') ? name.split('/')[0] : 'root',
+      description: `${fileCount} indexed files under ${name}`,
+    }));
+
+  if (ranked.length < 2) {
+    throw new Error('No distinct service or module folders were discovered in that repository.');
+  }
+
+  const edges: GraphEdge[] = [];
+  const rootNode =
+    ranked.find((n) => /^(main|index|app|server|api|gateway|core|src)$/.test(n.label.toLowerCase())) || ranked[0];
+
+  for (const node of ranked) {
+    if (node.id === rootNode.id) continue;
+    const isSoft = /(test|doc|util|helper|metric|log|telemetry|analytics|ui|style)/.test(node.id);
+    edges.push({
+      source: rootNode.id,
+      target: node.id,
+      dependency_type: isSoft ? 'soft' : 'hard',
+    });
+  }
+
+  for (let i = 1; i < ranked.length - 1; i += 2) {
+    const a = ranked[i];
+    const b = ranked[i + 1];
+    if (a.id !== rootNode.id && b.id !== rootNode.id) {
+      edges.push({
+        source: a.id,
+        target: b.id,
+        dependency_type: i % 4 === 1 ? 'hard' : 'soft',
+      });
+    }
+  }
+
+  return {
+    graph: { nodes: ranked, edges },
+    source: parsed.normalized,
+    via: 'github',
+  };
 }
 
-function runLocalFallbackSimulation(
+export function simulateGraphCascade(
   graph: GraphData,
-  targetNode: string,
+  failedNode: string,
   failureType: FailureType,
   mitigatedNodes: string[]
 ): SimulationResult {
   const mitigatedSet = new Set(mitigatedNodes);
+  const incomingCallers = new Map<string, Array<{ caller: string; type: DependencyType }>>();
+  for (const node of graph.nodes) {
+    incomingCallers.set(node.id, []);
+  }
+  for (const edge of graph.edges) {
+    const list = incomingCallers.get(edge.target);
+    if (list) {
+      list.push({ caller: edge.source, type: edge.dependency_type === 'soft' ? 'soft' : 'hard' });
+    }
+  }
+
   const visited = new Map<string, CascadeEntry>();
-  const queue: Array<{ id: string; state: 'broken' | 'warning'; hop: number }> = [
-    { id: targetNode, state: failureType === 'down' ? 'broken' : 'warning', hop: 0 },
+  const queue: Array<{ id: string; hop: number; parentState: 'broken' | 'degraded' }> = [
+    { id: failedNode, hop: 0, parentState: failureType === 'down' ? 'broken' : 'degraded' },
   ];
 
   while (queue.length > 0) {
-    const curr = queue.shift()!;
-    const outgoing = graph.edges.filter((e) => e.source === curr.id);
-    for (const edge of outgoing) {
-      if (edge.target === targetNode || edge.propagation === 'OPTIONAL') continue;
-      const isMitigated = mitigatedSet.has(curr.id) || mitigatedSet.has(edge.target);
-      const isHard = edge.dependency_type === 'hard' && !isMitigated;
-      const nextState: 'broken' | 'warning' =
-        curr.state === 'broken' && isHard ? 'broken' : 'warning';
-      const prev = visited.get(edge.target);
-      if (!prev || (prev.state === 'warning' && nextState === 'broken')) {
-        visited.set(edge.target, {
-          id: edge.target,
+    const current = queue.shift()!;
+    const callers = incomingCallers.get(current.id) || [];
+
+    for (const { caller, type } of callers) {
+      if (caller === failedNode) continue;
+
+      const isMitigated = mitigatedSet.has(caller);
+      let nextState: 'broken' | 'warning';
+      let reason: string;
+
+      if (isMitigated) {
+        nextState = 'warning';
+        reason = `Circuit breaker mitigated impact from ${current.id}`;
+      } else if (type === 'soft') {
+        nextState = 'warning';
+        reason = `Soft dependency degraded via ${current.id}`;
+      } else if (current.parentState === 'broken') {
+        nextState = 'broken';
+        reason = `Hard dependency unreachable: ${current.id}`;
+      } else {
+        nextState = 'warning';
+        reason = `Latency spike propagated from ${current.id}`;
+      }
+
+      const prev = visited.get(caller);
+      if (!prev || (prev.state !== 'broken' && nextState === 'broken')) {
+        visited.set(caller, {
+          id: caller,
           state: nextState,
-          hop: curr.hop + 1,
-          reason:
-            nextState === 'broken'
-              ? `Critical HARD dependency '${curr.id}' failed`
-              : `Degraded fallback from '${curr.id}'`,
+          hop: current.hop + 1,
+          reason,
         });
-        queue.push({ id: edge.target, state: nextState, hop: curr.hop + 1 });
+
+        if (!isMitigated && type === 'hard') {
+          queue.push({
+            id: caller,
+            hop: current.hop + 1,
+            parentState: nextState === 'broken' ? 'broken' : 'degraded',
+          });
+        }
       }
     }
   }
 
-  const cascade = Array.from(visited.values());
-  const brokenCount = cascade.filter((c) => c.state === 'broken').length;
-  const warningCount = cascade.length - brokenCount;
-  const severity = brokenCount >= 2 ? 'CRITICAL' : brokenCount >= 1 ? 'HIGH' : cascade.length > 0 ? 'MEDIUM' : 'LOW';
+  const cascade = Array.from(visited.values()).sort((a, b) => a.hop - b.hop || a.id.localeCompare(b.id));
+  const brokenCount = cascade.filter((c) => c.state === 'broken').length + (failureType === 'down' ? 1 : 0);
+  const warningCount = cascade.filter((c) => c.state !== 'broken').length + (failureType === 'degraded' ? 1 : 0);
+  const blastCount = cascade.length + 1;
+  const ratio = graph.nodes.length > 0 ? blastCount / graph.nodes.length : 0;
+
+  const criticality =
+    ratio >= 0.55 ? 'CRITICAL IMPACT' : ratio >= 0.3 ? 'HIGH IMPACT' : ratio >= 0.15 ? 'MODERATE IMPACT' : 'CONTAINED';
 
   return {
-    root_cause: targetNode,
+    root_cause: failedNode,
     failure_type: failureType,
-    blast_radius_count: cascade.length,
+    criticality,
+    blast_radius_count: blastCount,
     broken_count: brokenCount,
     warning_count: warningCount,
-    criticality: severity,
-    business_impact: [],
+    mitigated_nodes: mitigatedNodes,
     cascade,
   };
 }
 
 export async function runFailureSimulation(
   graph: GraphData,
-  targetNode: string,
+  failedNode: string,
   failureType: FailureType,
-  mitigatedNodes: string[] = []
-): Promise<{ simulation: SimulationResult; via: 'backend' | 'fallback' }> {
+  mitigatedNodes: string[],
+  apiBase = DEFAULT_API_BASE
+): Promise<{ simulation: SimulationResult; via: 'backend' | 'local' }> {
+  const baseline =
+    mitigatedNodes.length > 0 ? simulateGraphCascade(graph, failedNode, failureType, []) : null;
+
   try {
-    const res = await fetch(`${API_BASE}/simulate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        graph_id: graph.id || 'ecommerce-core',
-        node: targetNode,
-        failure: failureType === 'down' ? 'DOWN' : 'LATENCY',
-        mitigated_nodes: mitigatedNodes,
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) throw new Error('Simulation API error');
-    const data = await res.json();
-    return {
-      simulation: normalizeSimulationResult(data, failureType),
-      via: 'backend',
-    };
+    const res = await fetchWithTimeout(
+      `${apiBase}/api/simulate`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          graph_data: graph,
+          failed_node: failedNode,
+          failure_type: failureType,
+          mitigated_nodes: mitigatedNodes,
+        }),
+      },
+      3000
+    );
+    if (res.ok) {
+      const json = await res.json();
+      if (json?.simulation) {
+        const sim = json.simulation as SimulationResult;
+        if (baseline) {
+          sim.baseline_blast_count = baseline.blast_radius_count;
+          sim.saved_count = Math.max(0, baseline.broken_count - sim.broken_count);
+        }
+        return { simulation: sim, via: 'backend' };
+      }
+    }
   } catch {
-    return {
-      simulation: runLocalFallbackSimulation(graph, targetNode, failureType, mitigatedNodes),
-      via: 'fallback',
-    };
+    // Fall back to local graph cascade propagation engine
   }
+
+  const simulation = simulateGraphCascade(graph, failedNode, failureType, mitigatedNodes);
+  if (baseline) {
+    simulation.baseline_blast_count = baseline.blast_radius_count;
+    simulation.saved_count = Math.max(0, baseline.broken_count - simulation.broken_count);
+  }
+  return { simulation, via: 'local' };
+}
+
+export function computeSpofRisks(graph: GraphData, limit = 3): SpofRisk[] {
+  if (!graph.nodes.length) return [];
+  const total = graph.nodes.length;
+  return graph.nodes
+    .map((node) => {
+      const sim = simulateGraphCascade(graph, node.id, 'down', []);
+      return {
+        id: node.id,
+        label: node.label,
+        blastCount: sim.blast_radius_count,
+        brokenCount: sim.broken_count,
+        pct: Math.round((sim.blast_radius_count / total) * 100),
+      };
+    })
+    .sort((a, b) => b.brokenCount - a.brokenCount || b.blastCount - a.blastCount)
+    .slice(0, limit);
+}
+
+export function parseCustomManifest(rawText: string): { graph: GraphData; source: string } {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    throw new Error('Paste a JSON graph, package.json, or docker-compose.yml manifest.');
+  }
+
+  if (trimmed.startsWith('{')) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      throw new Error('Invalid JSON syntax.');
+    }
+
+    const candidate = (parsed.graph_data as Record<string, unknown> | undefined) ?? parsed;
+    if (Array.isArray(candidate.nodes) && Array.isArray(candidate.edges)) {
+      const nodes: GraphNode[] = candidate.nodes
+        .filter((n): n is Record<string, unknown> => Boolean(n && typeof n === 'object' && 'id' in n))
+        .map((n) => ({
+          id: String(n.id),
+          label: String(n.label || n.id),
+          tier: n.tier ? String(n.tier) : undefined,
+          protocol: n.protocol ? String(n.protocol) : undefined,
+          description: n.description ? String(n.description) : undefined,
+        }));
+      const idSet = new Set(nodes.map((n) => n.id));
+      const edges: GraphEdge[] = candidate.edges
+        .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object' && 'source' in e && 'target' in e))
+        .filter((e) => idSet.has(String(e.source)) && idSet.has(String(e.target)))
+        .map((e) => ({
+          source: String(e.source),
+          target: String(e.target),
+          dependency_type: e.dependency_type === 'soft' ? 'soft' : 'hard',
+        }));
+
+      if (nodes.length < 2) {
+        throw new Error('Graph JSON must contain at least 2 nodes.');
+      }
+      return { graph: { nodes, edges }, source: String(parsed.source || 'Custom JSON Graph') };
+    }
+
+    if (parsed.dependencies || parsed.devDependencies || parsed.peerDependencies) {
+      const rootId = String(parsed.name || 'app-root').toLowerCase().replace(/[^a-z0-9/_-]+/g, '-');
+      const deps = Object.keys((parsed.dependencies as Record<string, unknown>) || {});
+      const devDeps = Object.keys((parsed.devDependencies as Record<string, unknown>) || {});
+      const nodes: GraphNode[] = [
+        { id: rootId, label: String(parsed.name || 'Application'), tier: 'Root', protocol: 'npm' },
+      ];
+      const edges: GraphEdge[] = [];
+
+      for (const dep of deps.slice(0, 14)) {
+        const depId = dep.replace(/^@/, '').replace(/\//g, '-');
+        nodes.push({ id: depId, label: dep, tier: 'Runtime', protocol: 'npm' });
+        edges.push({ source: rootId, target: depId, dependency_type: 'hard' });
+      }
+      for (const devDep of devDeps.slice(0, Math.max(0, 18 - nodes.length))) {
+        const depId = devDep.replace(/^@/, '').replace(/\//g, '-');
+        if (!nodes.some((n) => n.id === depId)) {
+          nodes.push({ id: depId, label: devDep, tier: 'Build', protocol: 'npm' });
+          edges.push({ source: rootId, target: depId, dependency_type: 'soft' });
+        }
+      }
+
+      if (nodes.length < 2) {
+        throw new Error('No dependencies found in package.json.');
+      }
+      return { graph: { nodes, edges }, source: `${String(parsed.name || 'package.json')}` };
+    }
+
+    throw new Error('JSON must include { nodes, edges } or package.json dependencies.');
+  }
+
+  // Minimal docker-compose.yml parser for services & depends_on
+  const lines = trimmed.split(/\r?\n/);
+  const serviceNames: string[] = [];
+  const depsByService = new Map<string, string[]>();
+  let inServices = false;
+  let servicesIndent = -1;
+  let currentService: string | null = null;
+  let serviceIndent = -1;
+  let inDependsOn = false;
+  let dependsIndent = -1;
+
+  for (const rawLine of lines) {
+    if (!rawLine.trim() || rawLine.trim().startsWith('#')) continue;
+    const indent = rawLine.search(/\S/);
+    const content = rawLine.trim();
+
+    if (/^services:\s*$/.test(content)) {
+      inServices = true;
+      servicesIndent = indent;
+      currentService = null;
+      inDependsOn = false;
+      continue;
+    }
+
+    if (inServices && indent <= servicesIndent && /^[a-z0-9_-]+:/i.test(content)) {
+      inServices = false;
+      currentService = null;
+      inDependsOn = false;
+      continue;
+    }
+
+    if (!inServices) continue;
+
+    if (serviceIndent === -1 || indent === serviceIndent) {
+      const match = content.match(/^([a-zA-Z0-9._-]+):\s*$/);
+      if (match) {
+        serviceIndent = indent;
+        currentService = match[1];
+        serviceNames.push(currentService);
+        depsByService.set(currentService, []);
+        inDependsOn = false;
+        continue;
+      }
+    }
+
+    if (currentService && indent > serviceIndent) {
+      if (inDependsOn && indent <= dependsIndent) {
+        inDependsOn = false;
+      }
+      if (/^depends_on:\s*$/.test(content)) {
+        inDependsOn = true;
+        dependsIndent = indent;
+        continue;
+      }
+      const inlineDepends = content.match(/^depends_on:\s*\[([^\]]+)\]/);
+      if (inlineDepends) {
+        const items = inlineDepends[1].split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+        depsByService.get(currentService)?.push(...items);
+        continue;
+      }
+      if (inDependsOn) {
+        const listItem = content.match(/^-\s*([a-zA-Z0-9._-]+)/);
+        const mapItem = content.match(/^([a-zA-Z0-9._-]+):\s*/);
+        if (listItem) {
+          depsByService.get(currentService)?.push(listItem[1]);
+        } else if (mapItem) {
+          depsByService.get(currentService)?.push(mapItem[1]);
+        }
+      }
+    }
+  }
+
+  if (serviceNames.length < 2) {
+    throw new Error('Could not detect at least 2 services. Paste JSON, package.json, or docker-compose.yml.');
+  }
+
+  const nodes: GraphNode[] = serviceNames.map((name) => ({
+    id: name,
+    label: name,
+    tier: 'Container',
+    protocol: 'Docker',
+  }));
+  const idSet = new Set(serviceNames);
+  const edges: GraphEdge[] = [];
+  for (const [svc, deps] of depsByService.entries()) {
+    for (const dep of deps) {
+      if (idSet.has(dep) && svc !== dep) {
+        edges.push({ source: svc, target: dep, dependency_type: 'hard' });
+      }
+    }
+  }
+
+  return { graph: { nodes, edges }, source: 'docker-compose.yml' };
+}
+
+export function computeGraphLayout(graph: GraphData, width = 1000, height = 560): PositionedNode[] {
+  const nodes = graph.nodes.slice(0, 24);
+  if (nodes.length === 0) return [];
+  if (nodes.length === 1) {
+    return [{ ...nodes[0], x: width / 2, y: height / 2 }];
+  }
+
+  const idSet = new Set(nodes.map((n) => n.id));
+  const edges = graph.edges.filter((e) => idSet.has(e.source) && idSet.has(e.target) && e.source !== e.target);
+
+  const inDegree = new Map<string, number>();
+  const outMap = new Map<string, string[]>();
+  for (const n of nodes) {
+    inDegree.set(n.id, 0);
+    outMap.set(n.id, []);
+  }
+  for (const e of edges) {
+    inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1);
+    outMap.get(e.source)?.push(e.target);
+  }
+
+  // BFS topological tier assignment for clean left-to-right flow initialization
+  const depth = new Map<string, number>();
+  const roots = nodes.filter((n) => (inDegree.get(n.id) ?? 0) === 0).map((n) => n.id);
+  const queue = roots.length > 0 ? [...roots] : [nodes[0].id];
+  for (const r of queue) depth.set(r, 0);
+
+  let idx = 0;
+  while (idx < queue.length) {
+    const curr = queue[idx++];
+    const d = depth.get(curr) ?? 0;
+    for (const nxt of outMap.get(curr) ?? []) {
+      if (!depth.has(nxt) && d < 6) {
+        depth.set(nxt, d + 1);
+        queue.push(nxt);
+      }
+    }
+  }
+  for (const n of nodes) {
+    if (!depth.has(n.id)) depth.set(n.id, 1);
+  }
+
+  const maxDepth = Math.max(1, ...Array.from(depth.values()));
+  const byLayer = new Map<number, GraphNode[]>();
+  for (const n of nodes) {
+    const d = depth.get(n.id) ?? 0;
+    const arr = byLayer.get(d) ?? [];
+    arr.push(n);
+    byLayer.set(d, arr);
+  }
+
+  const coords = new Map<string, { x: number; y: number }>();
+  const padX = 115;
+  const padY = 84;
+  const usableW = width - padX * 2;
+  const usableH = height - padY * 2;
+
+  for (const [layerIdx, layerNodes] of byLayer.entries()) {
+    const x = padX + (layerIdx / maxDepth) * usableW;
+    layerNodes.forEach((n, i) => {
+      const yOffset = layerIdx % 2 === 1 ? 18 : -18;
+      const y =
+        layerNodes.length === 1
+          ? height / 2
+          : padY + (i / (layerNodes.length - 1)) * usableH + yOffset * 0.4;
+      coords.set(n.id, { x, y });
+    });
+  }
+
+  // Gentle force-relaxation pass to guarantee minimum spacing & prevent label overlap
+  const minDistX = 138;
+  const minDistY = 82;
+  for (let iter = 0; iter < 45; iter++) {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = coords.get(nodes[i].id)!;
+        const b = coords.get(nodes[j].id)!;
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const overlapX = minDistX - Math.abs(dx);
+        const overlapY = minDistY - Math.abs(dy);
+        if (overlapX > 0 && overlapY > 0) {
+          const pushY = (dy >= 0 ? 1 : -1) * overlapY * 0.24;
+          const pushX = (dx >= 0 ? 1 : -1) * overlapX * 0.14;
+          a.x = Math.max(padX, Math.min(width - padX, a.x - pushX));
+          b.x = Math.max(padX, Math.min(width - padX, b.x + pushX));
+          a.y = Math.max(padY, Math.min(height - padY, a.y - pushY));
+          b.y = Math.max(padY, Math.min(height - padY, b.y + pushY));
+        }
+      }
+    }
+  }
+
+  return nodes.map((n) => {
+    const c = coords.get(n.id)!;
+    return { ...n, x: Math.round(c.x), y: Math.round(c.y) };
+  });
 }
 
 export function getNodeStateMap(
   simulation: SimulationResult | null,
-  mitigatedNodes: string[] = []
+  mitigatedNodes: string[] = [],
+  maxHop?: number | null
 ): Record<string, NodeVisualState> {
   const map: Record<string, NodeVisualState> = {};
   for (const id of mitigatedNodes) {
     map[id] = 'mitigated';
   }
   if (!simulation) return map;
-
-  for (const item of simulation.cascade) {
-    map[item.id] = item.state === 'broken' ? 'broken' : 'warning';
+  for (const entry of simulation.cascade) {
+    if (typeof maxHop === 'number' && entry.hop > maxHop) continue;
+    map[entry.id] = entry.state === 'broken' ? 'broken' : 'warning';
   }
   if (simulation.root_cause) {
     map[simulation.root_cause] = 'root';
   }
   return map;
-}
-
-export function computeGraphLayout(
-  graph: GraphData,
-  width = 1000,
-  height = 560
-): Array<GraphNode & { x: number; y: number }> {
-  const nodes = graph.nodes || [];
-  if (nodes.length === 0) return [];
-
-  const padX = 110;
-  const padY = 80;
-  const usableW = Math.max(200, width - padX * 2);
-  const usableH = Math.max(180, height - padY * 2 - 24);
-
-  // Use explicit coordinates if present in graph data (normalized cleanly to viewport)
-  const hasPositions = nodes.every((n) => n.position && typeof n.position.x === 'number');
-  if (hasPositions) {
-    const xs = nodes.map((n) => n.position!.x);
-    const ys = nodes.map((n) => n.position!.y);
-    const minX = Math.min(...xs);
-    const maxX = Math.max(...xs);
-    const minY = Math.min(...ys);
-    const maxY = Math.max(...ys);
-    const spanX = maxX - minX || 1;
-    const spanY = maxY - minY || 1;
-
-    return nodes.map((n) => ({
-      ...n,
-      x: padX + ((n.position!.x - minX) / spanX) * usableW,
-      y: padY + ((n.position!.y - minY) / spanY) * usableH,
-    }));
-  }
-
-  // Otherwise compute topological layers left-to-right
-  const inDegree = new Map<string, number>();
-  const adj = new Map<string, string[]>();
-  nodes.forEach((n) => {
-    inDegree.set(n.id, 0);
-    adj.set(n.id, []);
-  });
-  (graph.edges || []).forEach((e) => {
-    if (adj.has(e.source) && inDegree.has(e.target) && e.source !== e.target) {
-      adj.get(e.source)!.push(e.target);
-      inDegree.set(e.target, (inDegree.get(e.target) || 0) + 1);
-    }
-  });
-
-  const depth = new Map<string, number>();
-  const queue = nodes.filter((n) => (inDegree.get(n.id) || 0) === 0).map((n) => n.id);
-  queue.forEach((id) => depth.set(id, 0));
-
-  while (queue.length > 0) {
-    const curr = queue.shift()!;
-    const d = depth.get(curr) || 0;
-    for (const nxt of adj.get(curr) || []) {
-      if ((depth.get(nxt) ?? -1) < d + 1 && d + 1 < nodes.length) {
-        depth.set(nxt, d + 1);
-        queue.push(nxt);
-      }
-    }
-  }
-
-  const columns = new Map<number, GraphNode[]>();
-  nodes.forEach((n) => {
-    const col = depth.get(n.id) ?? 0;
-    if (!columns.has(col)) columns.set(col, []);
-    columns.get(col)!.push(n);
-  });
-
-  const maxCol = Math.max(...Array.from(columns.keys()), 1);
-  const laidOut: Array<GraphNode & { x: number; y: number }> = [];
-
-  columns.forEach((colNodes, col) => {
-    const x = padX + (col / maxCol) * usableW;
-    colNodes.forEach((node, idx) => {
-      const y = padY + ((idx + 1) / (colNodes.length + 1)) * usableH;
-      laidOut.push({ ...node, x, y });
-    });
-  });
-
-  return laidOut;
 }
