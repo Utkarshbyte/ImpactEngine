@@ -12,6 +12,7 @@ import {
   Check,
   ChevronRight,
   Download,
+  FileCode2,
   Flame,
   FolderGit2,
   GitBranch,
@@ -19,20 +20,26 @@ import {
   LayoutGrid,
   Minus,
   Network,
+  Play,
   Plus,
   RotateCcw,
+  Search,
   Shield,
   SlidersHorizontal,
+  Square,
   X,
   Zap,
 } from 'lucide-react';
 import {
   checkBackendHealth,
   computeGraphLayout,
+  computeSpofRisks,
   getNodeStateMap,
   ingestGithubRepository,
   loadEcommerceArchitecture,
+  parseCustomManifest,
   runFailureSimulation,
+  type DependencyType,
   type FailureType,
   type GraphData,
   type NodeVisualState,
@@ -41,6 +48,7 @@ import {
 
 type TabId = 'overview' | 'topology' | 'simulate' | 'impact';
 type ThemeId = 'espresso' | 'carbon' | 'paper';
+type SourceTabId = 'github' | 'manifest';
 
 interface ThemePalette {
   id: ThemeId;
@@ -135,11 +143,22 @@ const TABS: Array<{ id: TabId; label: string; icon: React.ComponentType<{ classN
 
 const EASE_SMOOTH = [0.16, 1, 0.3, 1] as const;
 
+function readInitialTheme(): ThemeId {
+  try {
+    const saved = localStorage.getItem('impactengine_theme');
+    if (saved === 'espresso' || saved === 'carbon' || saved === 'paper') return saved;
+  } catch {
+    // Ignore storage access errors in restricted contexts
+  }
+  return 'espresso';
+}
+
 interface TopologyCanvasProps {
   graph: GraphData;
   simulation: SimulationResult | null;
   selectedNodeId: string | null;
   mitigatedNodes?: string[];
+  visibleHop?: number | null;
   onSelectNode: (id: string) => void;
   theme: ThemePalette;
   onChangeTheme?: (id: ThemeId) => void;
@@ -151,6 +170,7 @@ function TopologyCanvas({
   simulation,
   selectedNodeId,
   mitigatedNodes = [],
+  visibleHop = null,
   onSelectNode,
   theme,
   onChangeTheme,
@@ -166,20 +186,15 @@ function TopologyCanvas({
   }, [positioned]);
 
   const stateMap = useMemo(
-    () => getNodeStateMap(simulation, mitigatedNodes),
-    [simulation, mitigatedNodes]
+    () => getNodeStateMap(simulation, mitigatedNodes, visibleHop),
+    [simulation, mitigatedNodes, visibleHop]
   );
 
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
-  const dragRef = useRef<{ active: boolean; moved: boolean; startX: number; startY: number; origX: number; origY: number }>({
-    active: false,
-    moved: false,
-    startX: 0,
-    startY: 0,
-    origX: 0,
-    origY: 0,
-  });
+  const pointersRef = useRef<Map<number, { x: number; y: number }>>(new Map());
+  const pinchStartRef = useRef<{ dist: number; zoom: number } | null>(null);
+  const panStartRef = useRef<{ x: number; y: number; origX: number; origY: number } | null>(null);
 
   useEffect(() => {
     setZoom(1);
@@ -188,38 +203,57 @@ function TopologyCanvas({
 
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if ((e.target as HTMLElement).closest('[data-node-hit="true"]')) return;
-    dragRef.current = {
-      active: true,
-      moved: false,
-      startX: e.clientX,
-      startY: e.clientY,
-      origX: pan.x,
-      origY: pan.y,
-    };
-    e.currentTarget.setPointerCapture(e.pointerId);
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore pointer capture failures
+    }
+
+    if (pointersRef.current.size === 1) {
+      panStartRef.current = { x: e.clientX, y: e.clientY, origX: pan.x, origY: pan.y };
+      pinchStartRef.current = null;
+    } else if (pointersRef.current.size === 2) {
+      const pts = Array.from(pointersRef.current.values()) as Array<{ x: number; y: number }>;
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y) || 1;
+      pinchStartRef.current = { dist, zoom };
+      panStartRef.current = null;
+    }
   };
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (!dragRef.current.active) return;
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-      dragRef.current.moved = true;
+    if (!pointersRef.current.has(e.pointerId)) return;
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointersRef.current.size === 2 && pinchStartRef.current) {
+      const pts = Array.from(pointersRef.current.values()) as Array<{ x: number; y: number }>;
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y) || 1;
+      const ratio = dist / pinchStartRef.current.dist;
+      setZoom(Math.max(0.6, Math.min(2.2, Number((pinchStartRef.current.zoom * ratio).toFixed(2)))));
+    } else if (pointersRef.current.size === 1 && panStartRef.current) {
+      const dx = e.clientX - panStartRef.current.x;
+      const dy = e.clientY - panStartRef.current.y;
+      setPan({
+        x: Math.max(-320, Math.min(320, panStartRef.current.origX + dx)),
+        y: Math.max(-220, Math.min(220, panStartRef.current.origY + dy)),
+      });
     }
-    setPan({
-      x: Math.max(-320, Math.min(320, dragRef.current.origX + dx)),
-      y: Math.max(-220, Math.min(220, dragRef.current.origY + dy)),
-    });
   };
 
   const handlePointerUp = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (dragRef.current.active) {
-      dragRef.current.active = false;
-      try {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-      } catch {
-        // Ignore if pointer capture already released
-      }
+    pointersRef.current.delete(e.pointerId);
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture already released
+    }
+    if (pointersRef.current.size === 1) {
+      const remaining = Array.from(pointersRef.current.values())[0] as { x: number; y: number };
+      panStartRef.current = { x: remaining.x, y: remaining.y, origX: pan.x, origY: pan.y };
+      pinchStartRef.current = null;
+    } else if (pointersRef.current.size === 0) {
+      panStartRef.current = null;
+      pinchStartRef.current = null;
     }
   };
 
@@ -285,7 +319,8 @@ function TopologyCanvas({
               (tgtState === 'broken' || tgtState === 'root');
             const isWarnLink =
               !isBrokenLink &&
-              (srcState === 'warning' || tgtState === 'root' || tgtState === 'broken');
+              ((srcState === 'warning' && (tgtState === 'root' || tgtState === 'broken' || tgtState === 'warning')) ||
+                (srcState === 'mitigated' && (tgtState === 'root' || tgtState === 'broken')));
             const isSelectedLink = selectedNodeId === edge.source || selectedNodeId === edge.target;
 
             const stroke = isBrokenLink
@@ -452,6 +487,11 @@ function TopologyCanvas({
             Soft fallback
           </span>
         )}
+        {graph.nodes.length > 24 && (
+          <span className="font-mono text-[10px] text-[var(--text-muted)]">
+            Showing 24 of {graph.nodes.length}
+          </span>
+        )}
       </div>
 
       {/* Bottom-right touch-friendly zoom controls */}
@@ -477,7 +517,7 @@ function TopologyCanvas({
         </button>
         <button
           type="button"
-          onClick={() => setZoom((z) => Math.min(2, Number((z + 0.2).toFixed(2))))}
+          onClick={() => setZoom((z) => Math.min(2.2, Number((z + 0.2).toFixed(2))))}
           aria-label="Zoom in"
           className="flex min-h-[40px] min-w-[40px] items-center justify-center rounded-lg text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] active:scale-95"
         >
@@ -489,15 +529,16 @@ function TopologyCanvas({
 }
 
 export default function App() {
-  const [themeId, setThemeId] = useState<ThemeId>('espresso');
+  const [themeId, setThemeId] = useState<ThemeId>(readInitialTheme);
   const theme = THEMES[themeId];
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', themeId);
-    if (theme.isDark) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
+    document.documentElement.classList.toggle('dark', theme.isDark);
+    try {
+      localStorage.setItem('impactengine_theme', themeId);
+    } catch {
+      // Ignore storage write failures
     }
   }, [themeId, theme.isDark]);
 
@@ -505,6 +546,7 @@ export default function App() {
   const [graph, setGraph] = useState<GraphData | null>(null);
   const [sourceLabel, setSourceLabel] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [nodeSearch, setNodeSearch] = useState('');
 
   const [simulation, setSimulation] = useState<SimulationResult | null>(null);
   const [simTarget, setSimTarget] = useState<string>('');
@@ -512,9 +554,14 @@ export default function App() {
   const [mitigatedNodes, setMitigatedNodes] = useState<string[]>([]);
 
   const [impactFilter, setImpactFilter] = useState<'all' | 'broken' | 'warning'>('all');
+  const [impactMobileView, setImpactMobileView] = useState<'list' | 'map'>('list');
+  const [visibleHop, setVisibleHop] = useState<number | null>(null);
+  const [isReplaying, setIsReplaying] = useState(false);
 
   const [sourceSheetOpen, setSourceSheetOpen] = useState(false);
+  const [sourceTab, setSourceTab] = useState<SourceTabId>('github');
   const [repoUrl, setRepoUrl] = useState('');
+  const [manifestText, setManifestText] = useState('');
   const [isLoadingSource, setIsLoadingSource] = useState(false);
   const [isSimulating, setIsSimulating] = useState(false);
   const [sourceError, setSourceError] = useState<string | null>(null);
@@ -531,14 +578,48 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // Escape closes Source & Surface sheet
+  useEffect(() => {
+    if (!sourceSheetOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSourceSheetOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [sourceSheetOpen]);
+
+  // Hop-by-hop playback interval
+  const maxCascadeHop = useMemo(() => {
+    if (!simulation || simulation.cascade.length === 0) return 0;
+    return Math.max(...simulation.cascade.map((c) => c.hop));
+  }, [simulation]);
+
+  useEffect(() => {
+    if (!isReplaying || !simulation) return;
+    const timer = setInterval(() => {
+      setVisibleHop((prev) => {
+        const next = prev === null ? 0 : prev + 1;
+        if (next > maxCascadeHop) {
+          setIsReplaying(false);
+          return null;
+        }
+        return next;
+      });
+    }, 650);
+    return () => clearInterval(timer);
+  }, [isReplaying, simulation, maxCascadeHop]);
+
   const applyNewGraph = useCallback((nextGraph: GraphData, label: string) => {
     setGraph(nextGraph);
     setSourceLabel(label);
     const firstId = nextGraph.nodes[0]?.id ?? null;
     setSelectedNodeId(firstId);
     setSimTarget(firstId ?? '');
+    setNodeSearch('');
     setMitigatedNodes([]);
     setSimulation(null);
+    setVisibleHop(null);
+    setIsReplaying(false);
     setSourceError(null);
     setSourceSheetOpen(false);
   }, []);
@@ -575,9 +656,26 @@ export default function App() {
     [repoUrl, applyNewGraph, showToast]
   );
 
+  const handleImportManifest = useCallback(
+    (e: React.FormEvent) => {
+      e.preventDefault();
+      setSourceError(null);
+      try {
+        const { graph: parsedGraph, source } = parseCustomManifest(manifestText);
+        applyNewGraph(parsedGraph, source);
+        showToast(`Loaded ${source}`);
+      } catch (err) {
+        setSourceError(err instanceof Error ? err.message : 'Could not parse manifest.');
+      }
+    },
+    [manifestText, applyNewGraph, showToast]
+  );
+
   const handleRunSimulation = useCallback(async () => {
     if (!graph || !simTarget) return;
     setIsSimulating(true);
+    setVisibleHop(null);
+    setIsReplaying(false);
     try {
       const { simulation: result } = await runFailureSimulation(graph, simTarget, simMode, mitigatedNodes);
       setSimulation(result);
@@ -612,6 +710,8 @@ export default function App() {
     showToast('Impact dossier downloaded');
   }, [graph, simulation, sourceLabel, showToast]);
 
+  const spofRisks = useMemo(() => (graph ? computeSpofRisks(graph, 3) : []), [graph]);
+
   const stats = useMemo(() => {
     const nodeCount = graph?.nodes.length ?? 0;
     const edgeCount = graph?.edges.length ?? 0;
@@ -622,24 +722,45 @@ export default function App() {
     return { nodeCount, edgeCount, affected, broken, warning, pct };
   }, [graph, simulation]);
 
+  const filteredNodes = useMemo(() => {
+    if (!graph) return [];
+    const q = nodeSearch.trim().toLowerCase();
+    if (!q) return graph.nodes;
+    return graph.nodes.filter(
+      (n) => n.label.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)
+    );
+  }, [graph, nodeSearch]);
+
   const selectedNode = useMemo(
     () => graph?.nodes.find((n) => n.id === selectedNodeId) ?? null,
     [graph, selectedNodeId]
   );
 
   const selectedRelations = useMemo(() => {
-    if (!graph || !selectedNodeId) return { inbound: [] as string[], outbound: [] as string[] };
-    const inbound = graph.edges.filter((e) => e.target === selectedNodeId).map((e) => e.source);
-    const outbound = graph.edges.filter((e) => e.source === selectedNodeId).map((e) => e.target);
+    if (!graph || !selectedNodeId) {
+      return {
+        inbound: [] as Array<{ id: string; type: DependencyType }>,
+        outbound: [] as Array<{ id: string; type: DependencyType }>,
+      };
+    }
+    const inbound = graph.edges
+      .filter((e) => e.target === selectedNodeId)
+      .map((e) => ({ id: e.source, type: (e.dependency_type === 'soft' ? 'soft' : 'hard') as DependencyType }));
+    const outbound = graph.edges
+      .filter((e) => e.source === selectedNodeId)
+      .map((e) => ({ id: e.target, type: (e.dependency_type === 'soft' ? 'soft' : 'hard') as DependencyType }));
     return { inbound, outbound };
   }, [graph, selectedNodeId]);
 
   const filteredCascade = useMemo(() => {
     if (!simulation) return [];
-    if (impactFilter === 'all') return simulation.cascade;
-    if (impactFilter === 'broken') return simulation.cascade.filter((c) => c.state === 'broken');
-    return simulation.cascade.filter((c) => c.state !== 'broken');
-  }, [simulation, impactFilter]);
+    return simulation.cascade.filter((c) => {
+      if (typeof visibleHop === 'number' && c.hop > visibleHop) return false;
+      if (impactFilter === 'broken') return c.state === 'broken';
+      if (impactFilter === 'warning') return c.state !== 'broken';
+      return true;
+    });
+  }, [simulation, impactFilter, visibleHop]);
 
   const toggleMitigation = (nodeId: string) => {
     setMitigatedNodes((prev) =>
@@ -750,7 +871,6 @@ export default function App() {
                 <div className="grid flex-1 min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1.65fr_1fr]">
                   {!graph ? (
                     <div className="relative flex h-full min-h-0 flex-col items-center justify-center rounded-2xl border border-dashed border-[var(--border-hairline)] bg-[var(--bg-surface)]/70 p-6 text-center">
-                      {/* Quick background switcher directly accessible on empty canvas */}
                       <div className="absolute top-3 right-3 flex items-center gap-1 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-1">
                         {(Object.keys(THEMES) as ThemeId[]).map((id) => {
                           const item = THEMES[id];
@@ -783,7 +903,7 @@ export default function App() {
                         Map service dependencies and test failure cascades
                       </h1>
                       <p className="mt-2 max-w-md text-sm leading-relaxed text-[var(--text-secondary)]">
-                        Load the built-in E-Commerce service mesh or analyze any public GitHub repository to explore upstream and downstream impact.
+                        Load the built-in E-Commerce service mesh, connect a public GitHub repo, or paste a Docker/package manifest.
                       </p>
                       <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
                         <motion.button
@@ -803,7 +923,7 @@ export default function App() {
                           className="flex min-h-[46px] items-center gap-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-5 py-2.5 text-sm font-medium text-[var(--text-primary)] transition-opacity hover:opacity-90"
                         >
                           <GitBranch className="h-4 w-4" />
-                          <span>Connect GitHub Repo</span>
+                          <span>Repo or Manifest</span>
                         </motion.button>
                       </div>
                     </div>
@@ -842,71 +962,117 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Workflow Guide Panel */}
+                  {/* Workflow & Highest-Risk SPOF Panel */}
                   <div className="hidden lg:flex h-full min-h-0 flex-col justify-between rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-6">
-                    <div>
-                      <h2 className="font-display text-base font-semibold text-[var(--text-primary)]">
-                        Analysis Workflow
-                      </h2>
-                      <p className="mt-1 text-xs text-[var(--text-secondary)]">
-                        Modeled dependency analysis with zero impact on live systems.
-                      </p>
+                    {!graph ? (
+                      <div>
+                        <h2 className="font-display text-base font-semibold text-[var(--text-primary)]">
+                          Analysis Workflow
+                        </h2>
+                        <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                          Modeled dependency analysis with zero impact on live systems.
+                        </p>
 
-                      <div className="mt-5 divide-y divide-[var(--border-hairline)]">
-                        <button
-                          type="button"
-                          onClick={() => setSourceSheetOpen(true)}
-                          className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
-                        >
-                          <div>
-                            <div className={`text-xs font-medium ${theme.accentInk}`}>01. Discover</div>
-                            <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
-                              Index repository or demo mesh
+                        <div className="mt-5 divide-y divide-[var(--border-hairline)]">
+                          <button
+                            type="button"
+                            onClick={() => setSourceSheetOpen(true)}
+                            className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
+                          >
+                            <div>
+                              <div className={`text-xs font-medium ${theme.accentInk}`}>01. Discover</div>
+                              <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
+                                Index repository, manifest, or demo
+                              </div>
                             </div>
-                          </div>
-                          <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
-                        </button>
+                            <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
+                          </button>
 
-                        <button
-                          type="button"
-                          onClick={() => setActiveTab('topology')}
-                          className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
-                        >
-                          <div>
-                            <div className={`text-xs font-medium ${theme.accentInk}`}>02. Explore</div>
-                            <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
-                              Inspect upstream & downstream links
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab('topology')}
+                            className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
+                          >
+                            <div>
+                              <div className={`text-xs font-medium ${theme.accentInk}`}>02. Explore</div>
+                              <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
+                                Inspect hard & soft dependencies
+                              </div>
                             </div>
-                          </div>
-                          <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
-                        </button>
+                            <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
+                          </button>
 
-                        <button
-                          type="button"
-                          onClick={() => setActiveTab('simulate')}
-                          className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
-                        >
-                          <div>
-                            <div className={`text-xs font-medium ${theme.accentInk}`}>03. Simulate</div>
-                            <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
-                              Test outages, latency & circuit breakers
+                          <button
+                            type="button"
+                            onClick={() => setActiveTab('simulate')}
+                            className="group flex w-full min-h-[60px] items-center justify-between py-3.5 text-left transition-colors"
+                          >
+                            <div>
+                              <div className={`text-xs font-medium ${theme.accentInk}`}>03. Simulate</div>
+                              <div className="mt-0.5 text-sm font-medium text-[var(--text-primary)]">
+                                Test outages & circuit-breaker ROI
+                              </div>
                             </div>
-                          </div>
-                          <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
-                        </button>
+                            <ChevronRight className="h-4 w-4 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
+                          </button>
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <div className="flex flex-1 min-h-0 flex-col">
+                        <div className="flex items-center justify-between">
+                          <h2 className="font-display text-base font-semibold text-[var(--text-primary)]">
+                            Single Points of Failure
+                          </h2>
+                          <span className="text-xs text-[var(--text-muted)]">Worst-case blast</span>
+                        </div>
+                        <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                          Tap any critical service below to pre-load it in the failure simulator.
+                        </p>
+
+                        <div className="mt-4 divide-y divide-[var(--border-hairline)] overflow-y-auto no-scrollbar touch-pan">
+                          {spofRisks.map((risk, idx) => (
+                            <button
+                              key={risk.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedNodeId(risk.id);
+                                setSimTarget(risk.id);
+                                setActiveTab('simulate');
+                              }}
+                              className="group flex w-full min-h-[58px] items-center justify-between py-3 text-left transition-colors"
+                            >
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2 text-sm font-medium text-[var(--text-primary)]">
+                                  <span className={`font-mono text-xs ${theme.accentInk}`}>0{idx + 1}</span>
+                                  <span className="truncate">{risk.label}</span>
+                                </div>
+                                <div className="mt-0.5 font-mono text-xs text-[var(--text-secondary)] tabular-nums">
+                                  {risk.blastCount} impacted ({risk.pct}%) · {risk.brokenCount} broken
+                                </div>
+                              </div>
+                              <ChevronRight className="h-4 w-4 shrink-0 text-[var(--text-muted)] transition-transform group-hover:translate-x-0.5 group-hover:text-[var(--text-primary)]" />
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     <div className="pt-4 border-t border-[var(--border-hairline)]">
                       {graph ? (
                         <motion.button
                           type="button"
                           whileTap={{ scale: 0.97 }}
-                          onClick={() => setActiveTab('simulate')}
+                          onClick={() => {
+                            if (spofRisks[0]) {
+                              setSimTarget(spofRisks[0].id);
+                              setSelectedNodeId(spofRisks[0].id);
+                            }
+                            setActiveTab('simulate');
+                          }}
                           className={`flex min-h-[46px] w-full items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors ${theme.accentBg} ${theme.accentBgHover} ${theme.accentText}`}
                         >
                           <Flame className="h-4 w-4" />
-                          <span>Run Failure Simulation</span>
+                          <span>Simulate Highest-Risk Node</span>
                         </motion.button>
                       ) : (
                         <motion.button
@@ -970,13 +1136,35 @@ export default function App() {
                           }}
                           className="min-h-[44px] max-w-[200px] rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3 text-sm font-medium text-[var(--text-primary)] focus:outline-none"
                         >
-                          {graph.nodes.map((node) => (
+                          {(filteredNodes.length > 0 ? filteredNodes : graph.nodes).map((node) => (
                             <option key={node.id} value={node.id}>
                               {node.label}
                             </option>
                           ))}
                         </select>
                       </div>
+
+                      {graph.nodes.length > 8 && (
+                        <div className="relative mt-2.5 shrink-0">
+                          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-muted)]" />
+                          <input
+                            type="search"
+                            value={nodeSearch}
+                            onChange={(e) => {
+                              const next = e.target.value;
+                              setNodeSearch(next);
+                              const match = graph.nodes.find(
+                                (n) =>
+                                  n.label.toLowerCase().includes(next.toLowerCase()) ||
+                                  n.id.toLowerCase().includes(next.toLowerCase())
+                              );
+                              if (match) setSelectedNodeId(match.id);
+                            }}
+                            placeholder="Filter services…"
+                            className="min-h-[40px] w-full rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] pl-8 pr-3 text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
+                          />
+                        </div>
+                      )}
 
                       {selectedNode && (
                         <div className="mt-4 flex flex-1 min-h-0 flex-col justify-between overflow-y-auto no-scrollbar touch-pan">
@@ -1030,14 +1218,18 @@ export default function App() {
                                   <div className="text-xs text-[var(--text-muted)]">No recorded callers</div>
                                 ) : (
                                   <div className="flex flex-wrap gap-1.5">
-                                    {selectedRelations.inbound.map((id) => (
+                                    {selectedRelations.inbound.map((rel) => (
                                       <button
-                                        key={id}
+                                        key={`${rel.id}-${rel.type}`}
                                         type="button"
-                                        onClick={() => setSelectedNodeId(id)}
+                                        onClick={() => setSelectedNodeId(rel.id)}
                                         className="min-h-[38px] rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3 py-1.5 font-mono text-xs text-[var(--text-primary)] transition-opacity hover:opacity-85 active:scale-95"
                                       >
-                                        {id}
+                                        <span>{rel.id}</span>
+                                        <span className="mx-1.5 text-[var(--text-muted)]">·</span>
+                                        <span className={rel.type === 'hard' ? 'text-rose-400' : 'text-amber-400'}>
+                                          {rel.type}
+                                        </span>
                                       </button>
                                     ))}
                                   </div>
@@ -1052,14 +1244,18 @@ export default function App() {
                                   <div className="text-xs text-[var(--text-muted)]">No recorded dependencies</div>
                                 ) : (
                                   <div className="flex flex-wrap gap-1.5">
-                                    {selectedRelations.outbound.map((id) => (
+                                    {selectedRelations.outbound.map((rel) => (
                                       <button
-                                        key={id}
+                                        key={`${rel.id}-${rel.type}`}
                                         type="button"
-                                        onClick={() => setSelectedNodeId(id)}
+                                        onClick={() => setSelectedNodeId(rel.id)}
                                         className="min-h-[38px] rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-3 py-1.5 font-mono text-xs text-[var(--text-primary)] transition-opacity hover:opacity-85 active:scale-95"
                                       >
-                                        {id}
+                                        <span>{rel.id}</span>
+                                        <span className="mx-1.5 text-[var(--text-muted)]">·</span>
+                                        <span className={rel.type === 'hard' ? 'text-rose-400' : 'text-amber-400'}>
+                                          {rel.type}
+                                        </span>
                                       </button>
                                     ))}
                                   </div>
@@ -1117,7 +1313,11 @@ export default function App() {
                           {simulation && (
                             <button
                               type="button"
-                              onClick={() => setSimulation(null)}
+                              onClick={() => {
+                                setSimulation(null);
+                                setVisibleHop(null);
+                                setIsReplaying(false);
+                              }}
                               className="min-h-[36px] px-2 text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text-primary)]"
                             >
                               Reset
@@ -1126,9 +1326,24 @@ export default function App() {
                         </div>
 
                         <div>
-                          <label htmlFor="sim-target" className="block text-xs font-medium text-[var(--text-muted)] mb-1.5">
-                            Target service
-                          </label>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <label htmlFor="sim-target" className="text-xs font-medium text-[var(--text-muted)]">
+                              Target service
+                            </label>
+                            {spofRisks[0] && spofRisks[0].id !== simTarget && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSimTarget(spofRisks[0].id);
+                                  setSelectedNodeId(spofRisks[0].id);
+                                  setMitigatedNodes((prev) => prev.filter((id) => id !== spofRisks[0].id));
+                                }}
+                                className={`text-[11px] font-medium ${theme.accentInk}`}
+                              >
+                                Highest risk: {spofRisks[0].label}
+                              </button>
+                            )}
+                          </div>
                           <select
                             id="sim-target"
                             value={simTarget}
@@ -1231,10 +1446,13 @@ export default function App() {
                             onClick={() => setActiveTab('impact')}
                             className="flex min-h-[44px] w-full items-center justify-between rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] px-4 py-2 text-xs font-medium text-[var(--text-primary)]"
                           >
-                            <span>
-                              {simulation.blast_radius_count} services impacted · {simulation.criticality}
+                            <span className="truncate">
+                              {simulation.blast_radius_count} impacted
+                              {typeof simulation.saved_count === 'number' && simulation.saved_count > 0
+                                ? ` · ${simulation.saved_count} saved`
+                                : ` · ${simulation.criticality}`}
                             </span>
-                            <ArrowRight className={`h-4 w-4 ${theme.accentInk}`} />
+                            <ArrowRight className={`h-4 w-4 shrink-0 ${theme.accentInk}`} />
                           </button>
                         )}
                       </div>
@@ -1300,9 +1518,14 @@ export default function App() {
                     <div className="grid shrink-0 grid-cols-2 lg:grid-cols-4 rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] divide-y lg:divide-y-0 lg:divide-x divide-[var(--border-hairline)]">
                       <div className="px-4 py-3 sm:px-5">
                         <div className="text-xs text-[var(--text-muted)]">Blast radius</div>
-                        <div className="mt-1 font-mono text-2xl font-semibold tabular-nums text-[var(--text-primary)]">
-                          {stats.affected}{' '}
-                          <span className="text-sm font-normal text-[var(--text-muted)]">({stats.pct}%)</span>
+                        <div className="mt-1 flex items-baseline gap-2 font-mono text-2xl font-semibold tabular-nums text-[var(--text-primary)]">
+                          <span>{stats.affected}</span>
+                          <span className="text-xs font-normal text-[var(--text-muted)]">({stats.pct}%)</span>
+                          {typeof simulation.saved_count === 'number' && simulation.saved_count > 0 && (
+                            <span className="text-xs font-medium text-emerald-500">
+                              {simulation.saved_count} saved
+                            </span>
+                          )}
                         </div>
                       </div>
                       <div className="px-4 py-3 sm:px-5 border-l border-[var(--border-hairline)] lg:border-l-0">
@@ -1335,14 +1558,43 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* Mobile List / Map Switcher */}
+                    <div className="flex sm:hidden shrink-0 items-center justify-between gap-2">
+                      <div className="grid grid-cols-2 flex-1 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-1">
+                        <button
+                          type="button"
+                          onClick={() => setImpactMobileView('list')}
+                          className={`min-h-[38px] rounded-lg text-xs font-medium transition-colors ${
+                            impactMobileView === 'list'
+                              ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                              : 'text-[var(--text-muted)]'
+                          }`}
+                        >
+                          Cascade List
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setImpactMobileView('map')}
+                          className={`min-h-[38px] rounded-lg text-xs font-medium transition-colors ${
+                            impactMobileView === 'map'
+                              ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                              : 'text-[var(--text-muted)]'
+                          }`}
+                        >
+                          Blast Map
+                        </button>
+                      </div>
+                    </div>
+
                     {/* Split View: Graph & Cascade Breakdown */}
-                    <div className="grid flex-1 min-h-0 grid-cols-1 gap-4 lg:grid-cols-[1.2fr_1fr]">
-                      <div className="hidden sm:block min-h-0 h-full">
+                    <div className="grid flex-1 min-h-0 grid-cols-1 gap-4 sm:grid-cols-[1.2fr_1fr]">
+                      <div className={`${impactMobileView === 'map' ? 'block' : 'hidden'} sm:block min-h-0 h-full`}>
                         <TopologyCanvas
                           graph={graph}
                           simulation={simulation}
                           selectedNodeId={selectedNodeId}
                           mitigatedNodes={mitigatedNodes}
+                          visibleHop={visibleHop}
                           onSelectNode={(id) => setSelectedNodeId(id)}
                           theme={theme}
                           onChangeTheme={setThemeId}
@@ -1350,8 +1602,8 @@ export default function App() {
                         />
                       </div>
 
-                      <div className="flex h-full min-h-0 flex-col rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-4 sm:p-5">
-                        <div className="flex shrink-0 items-center justify-between gap-3 pb-3 border-b border-[var(--border-hairline)]">
+                      <div className={`${impactMobileView === 'list' ? 'flex' : 'hidden'} sm:flex h-full min-h-0 flex-col rounded-2xl border border-[var(--border-hairline)] bg-[var(--bg-surface)] p-4 sm:p-5`}>
+                        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 pb-3 border-b border-[var(--border-hairline)]">
                           <div>
                             <h2 className="font-display text-base font-semibold text-[var(--text-primary)]">
                               Cascade Breakdown
@@ -1379,10 +1631,66 @@ export default function App() {
                           </div>
                         </div>
 
+                        {/* Hop-by-hop cascade playback bar */}
+                        {maxCascadeHop > 0 && (
+                          <div className="mt-2.5 flex shrink-0 items-center justify-between gap-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] px-2.5 py-1.5">
+                            <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsReplaying(false);
+                                  setVisibleHop(null);
+                                }}
+                                className={`min-h-[32px] rounded-lg px-2.5 text-[11px] font-medium whitespace-nowrap ${
+                                  visibleHop === null
+                                    ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                                    : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                                }`}
+                              >
+                                All hops
+                              </button>
+                              {Array.from({ length: maxCascadeHop + 1 }, (_, h) => (
+                                <button
+                                  key={h}
+                                  type="button"
+                                  onClick={() => {
+                                    setIsReplaying(false);
+                                    setVisibleHop(h);
+                                  }}
+                                  className={`min-h-[32px] rounded-lg px-2 font-mono text-[11px] whitespace-nowrap ${
+                                    visibleHop === h
+                                      ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                                  }`}
+                                >
+                                  H{h}
+                                </button>
+                              ))}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (isReplaying) {
+                                  setIsReplaying(false);
+                                } else {
+                                  setVisibleHop(0);
+                                  setIsReplaying(true);
+                                }
+                              }}
+                              className={`flex min-h-[32px] shrink-0 items-center gap-1 rounded-lg px-2.5 text-[11px] font-medium ${theme.accentSoft} ${theme.accentInk}`}
+                            >
+                              {isReplaying ? <Square className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                              <span>{isReplaying ? 'Stop' : 'Replay'}</span>
+                            </button>
+                          </div>
+                        )}
+
                         <div className="mt-2 flex-1 min-h-0 overflow-y-auto no-scrollbar touch-pan divide-y divide-[var(--border-hairline)]">
                           {filteredCascade.length === 0 ? (
                             <div className="flex h-full items-center justify-center text-sm text-[var(--text-muted)] py-8">
-                              No downstream services affected under this filter.
+                              {visibleHop === 0
+                                ? `Hop 0: ${simulation.root_cause} failed. Advance hops to view cascade.`
+                                : 'No downstream services affected under this filter.'}
                             </div>
                           ) : (
                             filteredCascade.map((entry) => {
@@ -1488,7 +1796,7 @@ export default function App() {
                       Source & Surface
                     </h2>
                     <p className="text-xs text-[var(--text-secondary)]">
-                      Connect a repository, load the demo mesh, or switch canvas background.
+                      Analyze a repo, paste a manifest, or switch background theme.
                     </p>
                   </div>
                   <button
@@ -1532,35 +1840,98 @@ export default function App() {
                   </div>
                 </div>
 
-                <form onSubmit={handleAnalyzeRepo} className="mt-5 space-y-3">
-                  <label htmlFor="repo-input" className="block text-xs font-medium text-[var(--text-secondary)]">
-                    GitHub repository URL
-                  </label>
-                  <input
-                    id="repo-input"
-                    type="url"
-                    value={repoUrl}
-                    onChange={(e) => setRepoUrl(e.target.value)}
-                    placeholder="https://github.com/organization/repository"
-                    className="min-h-[48px] w-full rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] px-3.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
-                  />
-
-                  {sourceError && (
-                    <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-500">
-                      {sourceError}
-                    </div>
-                  )}
-
-                  <motion.button
-                    type="submit"
-                    whileTap={{ scale: 0.98 }}
-                    disabled={isLoadingSource}
-                    className={`flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition-colors disabled:opacity-60 ${theme.accentBg} ${theme.accentBgHover} ${theme.accentText}`}
+                {/* Source input mode switcher */}
+                <div className="mt-5 grid grid-cols-2 gap-1 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] p-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSourceTab('github');
+                      setSourceError(null);
+                    }}
+                    className={`min-h-[38px] rounded-lg text-xs font-medium transition-colors ${
+                      sourceTab === 'github'
+                        ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                    }`}
                   >
-                    <GitBranch className="h-4 w-4" />
-                    <span>{isLoadingSource ? 'Analyzing repository…' : 'Analyze Repository'}</span>
-                  </motion.button>
-                </form>
+                    GitHub URL
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSourceTab('manifest');
+                      setSourceError(null);
+                    }}
+                    className={`min-h-[38px] rounded-lg text-xs font-medium transition-colors ${
+                      sourceTab === 'manifest'
+                        ? 'bg-[var(--bg-subtle)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    Paste Manifest
+                  </button>
+                </div>
+
+                {sourceTab === 'github' ? (
+                  <form onSubmit={handleAnalyzeRepo} className="mt-4 space-y-3">
+                    <label htmlFor="repo-input" className="block text-xs font-medium text-[var(--text-secondary)]">
+                      GitHub repository URL
+                    </label>
+                    <input
+                      id="repo-input"
+                      type="url"
+                      value={repoUrl}
+                      onChange={(e) => setRepoUrl(e.target.value)}
+                      placeholder="https://github.com/organization/repository"
+                      className="min-h-[48px] w-full rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] px-3.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
+                    />
+
+                    {sourceError && (
+                      <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-500">
+                        {sourceError}
+                      </div>
+                    )}
+
+                    <motion.button
+                      type="submit"
+                      whileTap={{ scale: 0.98 }}
+                      disabled={isLoadingSource}
+                      className={`flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition-colors disabled:opacity-60 ${theme.accentBg} ${theme.accentBgHover} ${theme.accentText}`}
+                    >
+                      <GitBranch className="h-4 w-4" />
+                      <span>{isLoadingSource ? 'Analyzing repository…' : 'Analyze Repository'}</span>
+                    </motion.button>
+                  </form>
+                ) : (
+                  <form onSubmit={handleImportManifest} className="mt-4 space-y-3">
+                    <label htmlFor="manifest-input" className="block text-xs font-medium text-[var(--text-secondary)]">
+                      docker-compose.yml, package.json, or exported JSON
+                    </label>
+                    <textarea
+                      id="manifest-input"
+                      rows={4}
+                      value={manifestText}
+                      onChange={(e) => setManifestText(e.target.value)}
+                      placeholder={'services:\n  api:\n    depends_on:\n      - postgres\n  postgres: {}'}
+                      className="w-full rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-surface-alt)] p-3 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none"
+                    />
+
+                    {sourceError && (
+                      <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-500">
+                        {sourceError}
+                      </div>
+                    )}
+
+                    <motion.button
+                      type="submit"
+                      whileTap={{ scale: 0.98 }}
+                      className={`flex min-h-[48px] w-full items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition-colors ${theme.accentBg} ${theme.accentBgHover} ${theme.accentText}`}
+                    >
+                      <FileCode2 className="h-4 w-4" />
+                      <span>Parse Manifest</span>
+                    </motion.button>
+                  </form>
+                )}
 
                 <div className="my-4 flex items-center gap-3">
                   <div className="h-px flex-1 bg-[var(--border-hairline)]" />
@@ -1638,7 +2009,7 @@ function EmptyWorkspace({
       <Network className={`h-7 w-7 mb-3 ${theme.accentInk}`} />
       <h2 className="font-display text-xl font-semibold text-[var(--text-primary)]">No architecture loaded</h2>
       <p className="mt-1.5 max-w-md text-sm text-[var(--text-secondary)]">
-        Load the sample E-Commerce topology or analyze a GitHub repository to unlock this view.
+        Load the sample E-Commerce topology, analyze a GitHub repo, or paste a manifest to unlock this view.
       </p>
       <div className="mt-5 flex flex-wrap justify-center gap-3">
         <motion.button
@@ -1657,7 +2028,7 @@ function EmptyWorkspace({
           className="flex min-h-[46px] items-center gap-2 rounded-xl border border-[var(--border-hairline)] bg-[var(--bg-subtle)] px-5 py-2.5 text-sm font-medium text-[var(--text-primary)]"
         >
           <GitBranch className="h-4 w-4" />
-          <span>GitHub URL</span>
+          <span>Repo or Manifest</span>
         </motion.button>
       </div>
     </div>
