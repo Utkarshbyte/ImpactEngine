@@ -66,8 +66,8 @@ The backend exposes a REST API consumed by both the React frontend and the Strea
 | Persistence | SQLite |
 | Frontend | React 19, TypeScript, Vite, Tailwind CSS |
 | Alternative UI | Streamlit |
-| LLM integration | Gemini (via Prune API proxy) — optional |
-| Codebase ingestion | TinyFish API — optional |
+| LLM integration | Gemini (via Prune API proxy) for low use of gemini tokens |
+| Codebase ingestion | TinyFish API |
 
 ---
 
